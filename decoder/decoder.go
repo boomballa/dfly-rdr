@@ -19,7 +19,6 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/dongmx/rdb"
 	"github.com/dongmx/rdb/nopdecoder"
 )
 
@@ -33,6 +32,34 @@ type Entry struct {
 	FieldOfLargestElem string
 }
 
+// Info represents additional information about a Redis value
+type Info struct {
+	SizeOfValue int64
+	Encoding    string
+	Zips        uint64
+}
+
+// StreamGroups represents stream consumer groups
+type StreamGroups []StreamGroup
+
+// StreamGroup represents a single stream consumer group
+type StreamGroup struct {
+	Name      string
+	Consumers []StreamConsumer
+	Pending   []StreamPending
+}
+
+// StreamConsumer represents a stream consumer
+type StreamConsumer struct {
+	Name string
+}
+
+// StreamPending represents a pending entry in a stream
+type StreamPending struct {
+	ID       string
+	Consumer string
+}
+
 // Decoder decode rdb file
 type Decoder struct {
 	Entries chan *Entry
@@ -41,9 +68,9 @@ type Decoder struct {
 	usedMem int64
 	ctime   int64
 	count   int
-	rdbVer int
+	rdbVer  int
 
-	currentInfo  *rdb.Info
+	currentInfo  *Info
 	currentEntry *Entry
 
 	nopdecoder.NopDecoder
@@ -70,7 +97,14 @@ func (d *Decoder) GetUsedMem() int64 {
 	return d.usedMem
 }
 
-func (d *Decoder) StartRDB(ver int) {
+// StartRDB is called when parsing of a valid RDB file starts.
+func (d *Decoder) StartRDB() {
+	// 保持版本号为默认值
+	d.rdbVer = 0
+}
+
+// StartRDBWithVersion is an extended version of StartRDB that includes version information
+func (d *Decoder) StartRDBWithVersion(ver int) {
 	d.rdbVer = ver
 }
 
@@ -97,13 +131,12 @@ func (d *Decoder) Aux(key, value []byte) {
 	}
 }
 
-func (d *Decoder) StartStream(key []byte, cardinality, expiry int64, info *rdb.Info) {
+func (d *Decoder) StartStream(key []byte, cardinality, expiry int64) {
 	keyStr := string(key)
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
 	bytes += d.m.StreamOverhead()
 	bytes += d.m.SizeofStreamRadixTree(uint64(cardinality))
 
-	d.currentInfo = info
 	d.currentEntry = &Entry{
 		Key:              keyStr,
 		Bytes:            bytes,
@@ -118,7 +151,13 @@ func (d *Decoder) Xadd(key, id, listpack []byte) {
 	e.Bytes += d.m.mallocOverhead(uint64(len(listpack)))
 }
 
-func (d *Decoder) EndStream(key []byte, items uint64, lastEntryID string, cgroupsData rdb.StreamGroups) {
+func (d *Decoder) EndStream(key []byte) {
+	if d.currentEntry != nil {
+		d.sendEntry()
+	}
+}
+
+func (d *Decoder) EndStreamWithDetails(key []byte, items uint64, lastEntryID string, cgroupsData StreamGroups) {
 	e := d.currentEntry
 
 	for _, cg := range cgroupsData {
@@ -127,7 +166,7 @@ func (d *Decoder) EndStream(key []byte, items uint64, lastEntryID string, cgroup
 		e.Bytes += d.m.StreamNACK(pendingLength)
 
 		for _, c := range cg.Consumers {
-			e.Bytes += d.m.StreamConsumer(c.Name)
+			e.Bytes += d.m.StreamConsumer([]byte(c.Name))
 			pendingLength := uint64(len(cg.Pending))
 			e.Bytes += d.m.SizeofStreamRadixTree(pendingLength)
 		}
@@ -137,7 +176,7 @@ func (d *Decoder) EndStream(key []byte, items uint64, lastEntryID string, cgroup
 }
 
 // Set is called once for each string key.
-func (d *Decoder) Set(key, value []byte, expiry int64, info *rdb.Info) {
+func (d *Decoder) Set(key, value []byte, expiry int64) {
 	keyStr := string(key)
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
 	bytes += d.m.SizeofString(value)
@@ -152,21 +191,11 @@ func (d *Decoder) Set(key, value []byte, expiry int64, info *rdb.Info) {
 }
 
 // StartHash is called at the beginning of a hash.
-// Hset will be called exactly length times before EndHash.
-func (d *Decoder) StartHash(key []byte, length, expiry int64, info *rdb.Info) {
+func (d *Decoder) StartHash(key []byte, length, expiry int64) {
 	keyStr := string(key)
-
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
+	bytes += d.m.HashtableOverhead(uint64(length))
 
-	if info.SizeOfValue > 0 {
-		bytes += uint64(info.SizeOfValue)
-	} else if info.Encoding == "hashtable" {
-		bytes += d.m.HashtableOverhead(uint64(length))
-	} else {
-		panic(fmt.Sprintf("unexpected size(0) or encoding:%s", info.Encoding))
-	}
-
-	d.currentInfo = info
 	d.currentEntry = &Entry{
 		Key:       keyStr,
 		Bytes:     bytes,
@@ -202,9 +231,8 @@ func (d *Decoder) EndHash(key []byte) {
 }
 
 // StartSet is called at the beginning of a set.
-// Sadd will be called exactly cardinality times before EndSet.
-func (d *Decoder) StartSet(key []byte, cardinality, expiry int64, info *rdb.Info) {
-	d.StartHash(key, cardinality, expiry, info)
+func (d *Decoder) StartSet(key []byte, cardinality, expiry int64) {
+	d.StartHash(key, cardinality, expiry)
 }
 
 // Sadd is called once for each member of a set.
@@ -233,16 +261,10 @@ func (d *Decoder) EndSet(key []byte) {
 }
 
 // StartList is called at the beginning of a list.
-// Rpush will be called exactly length times before EndList.
-// If length of the list is not known, then length is -1
-func (d *Decoder) StartList(key []byte, length, expiry int64, info *rdb.Info) {
+func (d *Decoder) StartList(key []byte, length, expiry int64) {
 	keyStr := string(key)
-
-	d.currentInfo = info
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
 
-	//bug here length would be -1 if it is quicklist
-	//bytes += d.m.RobjOverhead() * uint64(length)
 	d.currentEntry = &Entry{
 		Key:       keyStr,
 		Bytes:     bytes,
@@ -311,25 +333,15 @@ func (d *Decoder) EndList(key []byte) {
 }
 
 // StartZSet is called at the beginning of a sorted set.
-// Zadd will be called exactly cardinality times before EndZSet.
-func (d *Decoder) StartZSet(key []byte, cardinality, expiry int64, info *rdb.Info) {
+func (d *Decoder) StartZSet(key []byte, cardinality, expiry int64) {
 	keyStr := string(key)
-
 	bytes := d.m.TopLevelObjOverhead(key, expiry)
-	d.currentInfo = info
-
-	if info.SizeOfValue > 0 {
-		bytes += uint64(info.SizeOfValue)
-	} else if info.Encoding == "skiplist" {
-		bytes += d.m.SkiplistOverhead(uint64(cardinality))
-	} else {
-		panic(fmt.Sprintf("unexpected size(0) or encoding:%s", info.Encoding))
-	}
+	bytes += d.m.HashtableOverhead(uint64(cardinality))
 
 	d.currentEntry = &Entry{
 		Key:       keyStr,
 		Bytes:     bytes,
-		Type:      "sortedset",
+		Type:      "zset",
 		NumOfElem: uint64(cardinality),
 	}
 }
