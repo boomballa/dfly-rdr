@@ -67,8 +67,9 @@ type Decoder struct {
 
 	usedMem int64
 	ctime   int64
-	count   int
-	rdbVer  int
+	// count tracks the number of processed entries during decoding
+	count  int
+	rdbVer int
 
 	currentInfo  *Info
 	currentEntry *Entry
