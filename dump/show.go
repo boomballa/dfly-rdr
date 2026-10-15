@@ -20,8 +20,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"syscall"
 	"time"
 
 	assetfs "github.com/elazarl/go-bindata-assetfs"
@@ -62,12 +66,21 @@ func Show(c *cli.Context) {
 		return
 	}
 
+	// 1. 忽略 SIGHUP 信号，防止终端断开或未加 nohup 运行时被系统挂断信号杀死
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP)
+	go func() {
+		for range sigChan {
+			// 忽略终端挂断信号，保障后台服务常驻
+		}
+	}()
+
 	// parse rdbfile
 	fmt.Fprintln(c.App.Writer, "start parsing...")
 	instances := []string{}
 	InitHTMLTmpl()
 
-	// 1. 同步解析初始指定的文件/目录，确保解析真正完成后再启动服务并输出 finished
+	// 2. 同步解析初始指定的文件/目录，确保解析真正完成后再启动服务并输出 finished
 	for _, pathname := range c.Args() {
 		for _, v := range listPathFiles(pathname) {
 			filename := filepath.Base(v)
@@ -87,7 +100,11 @@ func Show(c *cli.Context) {
 	}
 	tplCommonData["Instances"] = instances
 
-	// 2. 后台持续监控目录增量文件（如果是传入目录）
+	// 3. 解析完成后主动执行 GC 并将中间解压/解码临时内存归还给操作系统，防止触发系统 OOM-Killer
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	// 4. 后台持续监控目录增量文件（如果是传入目录）
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
@@ -112,7 +129,7 @@ func Show(c *cli.Context) {
 		}
 	}()
 
-	// 3. 所有初始文件解析完成后启动 http 服务并输出完成提示
+	// 5. 启动 http 报表服务并输出完成提示
 	staticFS := assetfs.AssetFS{
 		Asset:     static.Asset,
 		AssetDir:  static.AssetDir,
@@ -122,9 +139,12 @@ func Show(c *cli.Context) {
 	router.ServeFiles("/static/*filepath", &staticFS)
 	router.GET("/", index)
 	router.GET("/instance/:path", rdbReveal)
-	fmt.Fprintln(c.App.Writer, "parsing finished, please access http://{$IP}:"+c.String("port"))
-	listenErr := http.ListenAndServe(":"+c.String("port"), router)
+
+	port := c.String("port")
+	fmt.Fprintf(c.App.Writer, "parsing finished, please access http://{$IP}:%s\n", port)
+	listenErr := http.ListenAndServe(":"+port, router)
 	if listenErr != nil {
-		fmt.Fprintf(c.App.ErrWriter, "Listen port err: %v\n", listenErr)
+		fmt.Fprintf(c.App.ErrWriter, "\n[FATAL ERROR] http.ListenAndServe failed on port %s: %v\n", port, listenErr)
+		log.Fatalf("Listen port %s error: %v", port, listenErr)
 	}
 }
