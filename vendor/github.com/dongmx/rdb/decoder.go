@@ -125,12 +125,23 @@ const (
 	TypeSetIntset       ValueType = 11
 	TypeZSetZiplist     ValueType = 12
 	TypeHashZiplist     ValueType = 13
-	TypeListQuicklist   ValueType = 14
-	TypeStreamListPacks ValueType = 15
+	TypeListQuicklist    ValueType = 14
+	TypeStreamListPacks  ValueType = 15
+	TypeHashListpack     ValueType = 16
+	TypeZSetListpack     ValueType = 17
+	TypeListQuicklist2   ValueType = 18
+	TypeStreamListPacks2 ValueType = 19
+	TypeSetListpack      ValueType = 20
+	TypeStreamListPacks3 ValueType = 21
 )
 
 const (
-	rdbVersion  = 9
+	quicklistNodeContainerPlain  = 1
+	quicklistNodeContainerPacked = 2
+)
+
+const (
+	rdbVersion  = 11
 	rdb6bitLen  = 0
 	rdb14bitLen = 1
 	rdb32bitLen = 0x80
@@ -419,8 +430,16 @@ func (d *decode) readObject(key []byte, typ ValueType, expiry int64) error {
 		return d.readZiplistZset(key, expiry)
 	case TypeHashZiplist:
 		return d.readZiplistHash(key, expiry)
-	case TypeStreamListPacks:
-		return d.readStream(key, expiry)
+	case TypeHashListpack:
+		return d.readListpackHash(key, expiry)
+	case TypeZSetListpack:
+		return d.readListpackZset(key, expiry)
+	case TypeListQuicklist2:
+		return d.readQuicklist2(key, expiry)
+	case TypeSetListpack:
+		return d.readListpackSet(key, expiry)
+	case TypeStreamListPacks, TypeStreamListPacks2, TypeStreamListPacks3:
+		return d.readStream(key, expiry, typ)
 	case TypeModule:
 		fallthrough
 	case TypeModule2:
@@ -439,7 +458,7 @@ func (d *decode) readModule(key []byte, expiry int64) error {
 	return fmt.Errorf("Not supported load module %v", moduleid)
 }
 
-func (d *decode) readStream(key []byte, expiry int64) error {
+func (d *decode) readStream(key []byte, expiry int64, typ ValueType) error {
 	cardinality, _, err := d.readLength()
 	if err != nil {
 		return err
@@ -452,17 +471,11 @@ func (d *decode) readStream(key []byte, expiry int64) error {
 		if err != nil {
 			return err
 		}
-		/*
-			IDms := strconv.FormatUint(binary.BigEndian.Uint64(streamID[:8]), 10)
-			IDseq := strconv.FormatUint(binary.BigEndian.Uint64(streamID[8:]), 10)
-			fmt.Println(string(key))
-			fmt.Println(IDms + "-" + IDseq)
-		*/
-		err = d.readListPack()
+		listpack, err := d.readString()
 		if err != nil {
 			return err
 		}
-		d.event.Xadd(key, streamID, []byte{})
+		d.event.Xadd(key, streamID, listpack)
 	}
 	var length, lastIDms, lastIDseq uint64
 	length, _, err = d.readLength()
@@ -478,6 +491,30 @@ func (d *decode) readStream(key []byte, expiry int64) error {
 		return err
 	}
 	_, _, _ = length, lastIDms, lastIDseq
+
+	if typ == TypeStreamListPacks2 || typ == TypeStreamListPacks3 {
+		firstIDms, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		firstIDseq, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		maxDeletedIDms, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		maxDeletedIDseq, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		entriesAdded, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		_, _, _, _, _ = firstIDms, firstIDseq, maxDeletedIDms, maxDeletedIDseq, entriesAdded
+	}
 
 	//TODO output consumer groups
 	var groupsCount uint64
@@ -496,6 +533,14 @@ func (d *decode) readStream(key []byte, expiry int64) error {
 		gIDseq, _, _ := d.readLength()
 		_, _, _ = name, gIDms, gIDseq
 
+		if typ == TypeStreamListPacks2 || typ == TypeStreamListPacks3 {
+			entriesRead, _, err := d.readLength()
+			if err != nil {
+				return err
+			}
+			_ = entriesRead
+		}
+
 		pelSize, _, _ := d.readLength()
 		for pelSize > 0 {
 			pelSize--
@@ -510,6 +555,13 @@ func (d *decode) readStream(key []byte, expiry int64) error {
 			consumersNum--
 			d.readString()
 			d.readUint64()
+			if typ == TypeStreamListPacks2 || typ == TypeStreamListPacks3 {
+				activeTime, err := d.readUint64()
+				if err != nil {
+					return err
+				}
+				_ = activeTime
+			}
 			pelSize, _, _ := d.readLength()
 			for pelSize > 0 {
 				pelSize--
@@ -621,125 +673,251 @@ func readZipmapItemLength(buf *sliceBuffer, readFree bool) (int, int, error) {
 	return int(b), int(free), err
 }
 
-func (d *decode) readListPack() error {
+func lpBacklenSize(l uint64) int {
+	if l <= 127 {
+		return 1
+	} else if l <= 16383 {
+		return 2
+	} else if l <= 2097151 {
+		return 3
+	} else if l <= 268435455 {
+		return 4
+	}
+	return 5
+}
+
+func readListpackEntry(buf *sliceBuffer) ([]byte, error) {
+	b0, err := buf.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if b0 == byte(rdbLpEOF) {
+		return nil, io.EOF
+	}
+
+	var entry []byte
+	var entryLen uint64
+
+	switch {
+	case lpEncodingIs7BitUint(b0):
+		val := int64(b0 & 0x7F)
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 1
+	case lpEncodingIs6BitStr(b0):
+		slen := int(lpEncoding6BitStrLen([]byte{b0}))
+		s, err := buf.Slice(slen)
+		if err != nil {
+			return nil, err
+		}
+		entry = s
+		entryLen = uint64(1 + slen)
+	case lpEncodingIs13BitInt(b0):
+		b1, err := buf.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		uval := (uint64(b0&0x1F) << 8) | uint64(b1)
+		negstart := uint64(1) << 12
+		negmax := uint64(8191)
+		var val int64
+		if uval >= negstart {
+			val = -int64(negmax-uval) - 1
+		} else {
+			val = int64(uval)
+		}
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 2
+	case lpEncodingIs16BitInt(b0):
+		bytes, err := buf.Slice(2)
+		if err != nil {
+			return nil, err
+		}
+		val := int64(int16(binary.LittleEndian.Uint16(bytes)))
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 3
+	case lpEncodingIs24BitInt(b0):
+		bytes, err := buf.Slice(3)
+		if err != nil {
+			return nil, err
+		}
+		uval := uint32(bytes[0]) | (uint32(bytes[1]) << 8) | (uint32(bytes[2]) << 16)
+		if uval&0x800000 != 0 {
+			uval |= 0xFF000000
+		}
+		val := int64(int32(uval))
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 4
+	case lpEncodingIs32BitInt(b0):
+		bytes, err := buf.Slice(4)
+		if err != nil {
+			return nil, err
+		}
+		val := int64(int32(binary.LittleEndian.Uint32(bytes)))
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 5
+	case lpEncodingIs64BitInt(b0):
+		bytes, err := buf.Slice(8)
+		if err != nil {
+			return nil, err
+		}
+		val := int64(binary.LittleEndian.Uint64(bytes))
+		entry = []byte(strconv.FormatInt(val, 10))
+		entryLen = 9
+	case lpEncodingIs12BitStr(b0):
+		b1, err := buf.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		slen := int((uint32(b0&0x0F) << 8) | uint32(b1))
+		s, err := buf.Slice(slen)
+		if err != nil {
+			return nil, err
+		}
+		entry = s
+		entryLen = uint64(2 + slen)
+	case lpEncodingIs32BitStr(b0):
+		lenBytes, err := buf.Slice(4)
+		if err != nil {
+			return nil, err
+		}
+		slen := int(binary.LittleEndian.Uint32(lenBytes))
+		s, err := buf.Slice(slen)
+		if err != nil {
+			return nil, err
+		}
+		entry = s
+		entryLen = uint64(5 + slen)
+	default:
+		return nil, fmt.Errorf("unknown listpack entry encoding: 0x%02x", b0)
+	}
+
+	// Skip backlen
+	backlen := lpBacklenSize(entryLen)
+	if _, err := buf.Slice(backlen); err != nil {
+		return nil, err
+	}
+
+	return entry, nil
+}
+
+func readAllListpackEntries(buf *sliceBuffer) ([][]byte, error) {
+	var entries [][]byte
+	for {
+		entry, err := readListpackEntry(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func (d *decode) readListpackHash(key []byte, expiry int64) error {
 	listpack, err := d.readString()
-	//fmt.Println(len(listpack))
-	//fmt.Println(listpack)
 	if err != nil {
 		return err
 	}
 	buf := newSliceBuffer(listpack)
-	buf.Slice(4) // total bytes
-	numElements, _ := buf.Slice(2)
-	num := int64(binary.LittleEndian.Uint16(numElements))
+	buf.Seek(6, 0)
+	entries, err := readAllListpackEntries(buf)
 	if err != nil {
 		return err
 	}
-	for {
-		num--
-		b, _ := buf.Slice(1)
-		if b[0] == byte(rdbLpEOF) {
-			fmt.Println("eof")
-			break
-		}
-		//lpGet(b, buf)
+	length := int64(len(entries) / 2)
+	d.event.StartHash(key, length, expiry)
+	for i := 0; i+1 < len(entries); i += 2 {
+		field := entries[i]
+		val := entries[i+1]
+		d.event.Hset(key, field, val)
 	}
+	d.event.EndHash(key)
 	return nil
 }
 
-func lpGet(b []byte, buf *sliceBuffer) {
-	var val int64
-	var uval, negstart, negmax uint64
-	fmt.Println(b[0], lpEncodingIs7BitUint(b[0]))
-	if lpEncodingIs7BitUint(b[0]) {
-		fmt.Println("lpEncodingIs7BitUint")
-		negstart = math.MaxUint64
-		negmax = 0
-		uval = uint64(b[0] & 0x7F)
-	} else if lpEncodingIs6BitStr(b[0]) {
-		fmt.Println("lpEncodingIs6BitStr")
-		len := lpEncoding6BitStrLen(b)
-		str, _ := buf.Slice(int(len))
-		fmt.Print(string(str))
-	} else if lpEncodingIs13BitInt(b[0]) {
-		fmt.Println("lpEncodingIs13BitInt")
-		tmp, _ := buf.Slice(1)
-		b = append(b, tmp...)
-		uval = (uint64(b[0]&0x1f) << 8) | uint64(b[1])
-		negstart = uint64(1) << 12
-		negmax = 8191
-	} else if lpEncodingIs16BitInt(b[0]) {
-		fmt.Println("lpEncodingIs16BitInt")
-		tmp, _ := buf.Slice(2)
-		b = append(b, tmp...)
-		uval = uint64(b[1]) |
-			uint64(b[2])<<8
-		negstart = uint64(1) << 15
-		negmax = math.MaxUint16
-	} else if lpEncodingIs24BitInt(b[0]) {
-		fmt.Println("lpEncodingIs24BitInt")
-		tmp, _ := buf.Slice(3)
-		b = append(b, tmp...)
-		uval = uint64(b[1]) |
-			uint64(b[2])<<8 |
-			uint64(b[3])<<16
-		negstart = uint64(1) << 23
-		negmax = math.MaxUint32 >> 8
-	} else if lpEncodingIs32BitInt(b[0]) {
-		fmt.Println("lpEncodingIs32BitInt")
-		tmp, _ := buf.Slice(4)
-		b = append(b, tmp...)
-		uval = uint64(b[1]) |
-			uint64(b[2])<<8 |
-			uint64(b[3])<<16 |
-			uint64(b[4])<<24
-		negstart = uint64(1) << 31
-		negmax = math.MaxUint32
-	} else if lpEncodingIs64BitInt(b[0]) {
-		fmt.Println("lpEncodingIs64BitInt")
-		tmp, _ := buf.Slice(8)
-		b = append(b, tmp...)
-		uval = uint64(b[1]) |
-			uint64(b[2])<<8 |
-			uint64(b[3])<<16 |
-			uint64(b[4])<<24 |
-			uint64(b[5])<<32 |
-			uint64(b[6])<<40 |
-			uint64(b[7])<<48 |
-			uint64(b[8])<<56
-		negstart = uint64(1) << 63
-		negmax = math.MaxUint64
-	} else if lpEncodingIs12BitStr(b[0]) {
-		fmt.Println("lpEncodingIs12BitStr")
-		tmp, _ := buf.Slice(1)
-		b = append(b, tmp...)
-		len := lpEncoding12BitStrLen(b)
-		fmt.Println(len)
-		str, _ := buf.Slice(int(len))
-		fmt.Print(string(str))
-	} else if lpEncodingIs32BitStr(b[0]) {
-		fmt.Println("lpEncodingIs32BitStr")
-		tmp, _ := buf.Slice(4)
-		b = append(b, tmp...)
-		len := lpEncoding32BitStrLen(b)
-		str, _ := buf.Slice(int(len))
-		fmt.Print(string(str))
-	} else {
-		fmt.Println("else")
-		uval = uint64(12345678900000000) + uint64(b[0])
-		negstart = math.MaxUint64
-		negmax = 0
+func (d *decode) readListpackZset(key []byte, expiry int64) error {
+	listpack, err := d.readString()
+	if err != nil {
+		return err
 	}
-
-	if uval >= negstart {
-		uval = negmax - uval
-		val = int64(uval)
-		val = -val - 1
-	} else {
-		val = int64(uval)
+	buf := newSliceBuffer(listpack)
+	buf.Seek(6, 0)
+	entries, err := readAllListpackEntries(buf)
+	if err != nil {
+		return err
 	}
+	cardinality := int64(len(entries) / 2)
+	d.event.StartZSet(key, cardinality, expiry)
+	for i := 0; i+1 < len(entries); i += 2 {
+		member := entries[i]
+		scoreBytes := entries[i+1]
+		score, _ := strconv.ParseFloat(string(scoreBytes), 64)
+		d.event.Zadd(key, score, member)
+	}
+	d.event.EndZSet(key)
+	return nil
+}
 
-	fmt.Printf("%d\n", val)
+func (d *decode) readListpackSet(key []byte, expiry int64) error {
+	listpack, err := d.readString()
+	if err != nil {
+		return err
+	}
+	buf := newSliceBuffer(listpack)
+	buf.Seek(6, 0)
+	entries, err := readAllListpackEntries(buf)
+	if err != nil {
+		return err
+	}
+	cardinality := int64(len(entries))
+	d.event.StartSet(key, cardinality, expiry)
+	for _, member := range entries {
+		d.event.Sadd(key, member)
+	}
+	d.event.EndSet(key)
+	return nil
+}
+
+func (d *decode) readQuicklist2(key []byte, expiry int64) error {
+	length, _, err := d.readLength()
+	if err != nil {
+		return err
+	}
+	d.event.StartList(key, -1, expiry)
+	for length > 0 {
+		length--
+		container, _, err := d.readLength()
+		if err != nil {
+			return err
+		}
+		if container == quicklistNodeContainerPlain {
+			entry, err := d.readString()
+			if err != nil {
+				return err
+			}
+			d.event.Rpush(key, entry)
+		} else if container == quicklistNodeContainerPacked {
+			listpack, err := d.readString()
+			if err != nil {
+				return err
+			}
+			buf := newSliceBuffer(listpack)
+			buf.Seek(6, 0)
+			entries, err := readAllListpackEntries(buf)
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				d.event.Rpush(key, entry)
+			}
+		} else {
+			return fmt.Errorf("rdb: unknown quicklist2 container %d for key %s", container, key)
+		}
+	}
+	d.event.EndList(key)
+	return nil
 }
 
 func lpEncodingIs7BitUint(b byte) bool {

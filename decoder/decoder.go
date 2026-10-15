@@ -215,7 +215,7 @@ func (d *Decoder) Hset(key, field, value []byte) {
 		e.LenOfLargestElem = lenOfElem
 	}
 
-	if d.currentInfo.Encoding == "hashtable" {
+	if d.currentInfo != nil && d.currentInfo.Encoding == "hashtable" {
 		e.Bytes += d.m.SizeofString(field)
 		e.Bytes += d.m.SizeofString(value)
 		e.Bytes += d.m.HashtableEntryOverhead()
@@ -223,6 +223,10 @@ func (d *Decoder) Hset(key, field, value []byte) {
 		if d.rdbVer < 8 {
 			e.Bytes += 2 * d.m.RobjOverhead()
 		}
+	} else {
+		e.Bytes += d.m.SizeofString(field)
+		e.Bytes += d.m.SizeofString(value)
+		e.Bytes += d.m.HashtableEntryOverhead()
 	}
 }
 
@@ -245,13 +249,16 @@ func (d *Decoder) Sadd(key, member []byte) {
 		e.LenOfLargestElem = lenOfElem
 	}
 
-	if d.currentInfo.Encoding == "hashtable" {
+	if d.currentInfo != nil && d.currentInfo.Encoding == "hashtable" {
 		e.Bytes += d.m.SizeofString(member)
 		e.Bytes += d.m.HashtableEntryOverhead()
 
 		if d.rdbVer < 8 {
 			e.Bytes += d.m.RobjOverhead()
 		}
+	} else {
+		e.Bytes += d.m.SizeofString(member)
+		e.Bytes += d.m.HashtableEntryOverhead()
 	}
 }
 
@@ -280,28 +287,29 @@ func (d *Decoder) Rpush(key, value []byte) {
 	e := d.currentEntry
 	e.NumOfElem++
 
-	switch d.currentInfo.Encoding {
-	case "quicklist":
-		e.Bytes += d.m.ZiplistEntryOverhead(value)
+	if d.currentInfo != nil {
+		switch d.currentInfo.Encoding {
+		case "quicklist", "ziplist":
+			e.Bytes += d.m.ZiplistEntryOverhead(value)
 
-	case "ziplist":
-		e.Bytes += d.m.ZiplistEntryOverhead(value)
+		case "linkedlist":
+			sizeInlist := uint64(0)
+			if _, err := strconv.ParseInt(string(value), 10, 32); err != nil {
+				sizeInlist = d.m.SizeofString(value)
+			}
 
-	case "linkedlist":
-		sizeInlist := uint64(0)
-		if _, err := strconv.ParseInt(string(value), 10, 32); err != nil {
-			sizeInlist = d.m.SizeofString(value)
+			e.Bytes += d.m.LinkedListEntryOverhead()
+			e.Bytes += sizeInlist
+
+			if d.rdbVer < 8 {
+				e.Bytes += d.m.RobjOverhead()
+			}
+
+		default:
+			e.Bytes += d.m.ZiplistEntryOverhead(value)
 		}
-
-		e.Bytes += d.m.LinkedListEntryOverhead()
-		e.Bytes += sizeInlist
-
-		if d.rdbVer < 8 {
-			e.Bytes += d.m.RobjOverhead()
-		}
-
-	default:
-		panic(fmt.Sprintf("unknown encoding:%s", d.currentInfo.Encoding))
+	} else {
+		e.Bytes += d.m.ZiplistEntryOverhead(value)
 	}
 
 	lenOfElem := d.m.ElemLen(value)
@@ -315,19 +323,21 @@ func (d *Decoder) Rpush(key, value []byte) {
 func (d *Decoder) EndList(key []byte) {
 	e := d.currentEntry
 
-	switch d.currentInfo.Encoding {
-	case "quicklist":
-		e.Bytes += d.m.QuicklistOverhead(d.currentInfo.Zips)
-		e.Bytes += d.m.ZiplistHeaderOverhead() * d.currentInfo.Zips
+	if d.currentInfo != nil {
+		switch d.currentInfo.Encoding {
+		case "quicklist":
+			e.Bytes += d.m.QuicklistOverhead(d.currentInfo.Zips)
+			e.Bytes += d.m.ZiplistHeaderOverhead() * d.currentInfo.Zips
 
-	case "ziplist":
-		e.Bytes += d.m.ZiplistHeaderOverhead()
+		case "ziplist":
+			e.Bytes += d.m.ZiplistHeaderOverhead()
 
-	case "linkedlist":
-		e.Bytes += d.m.LinkedlistOverhead()
+		case "linkedlist":
+			e.Bytes += d.m.LinkedlistOverhead()
 
-	default:
-		panic(fmt.Sprintf("unknown encoding:%s", d.currentInfo.Encoding))
+		default:
+			// fallback
+		}
 	}
 
 	d.sendEntry()
@@ -356,14 +366,18 @@ func (d *Decoder) Zadd(key []byte, score float64, member []byte) {
 		e.LenOfLargestElem = lenOfElem
 	}
 
-	if d.currentInfo.Encoding == "skiplist" {
+	if d.currentInfo != nil && d.currentInfo.Encoding == "skiplist" {
 		e.Bytes += 8 // sizeof(score)
 		e.Bytes += d.m.SizeofString(member)
 		e.Bytes += d.m.SkiplistEntryOverhead()
 
 		if d.rdbVer < 8 {
-			e.Bytes += d.m.RobjOverhead()
+			e.Bytes += 2 * d.m.RobjOverhead()
 		}
+	} else {
+		e.Bytes += 8 // sizeof(score)
+		e.Bytes += d.m.SizeofString(member)
+		e.Bytes += d.m.SkiplistEntryOverhead()
 	}
 }
 
