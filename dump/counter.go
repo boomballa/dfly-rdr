@@ -308,6 +308,9 @@ func (h prefixHeap) Less(i, j int) bool {
 		if h[i].Num < h[j].Num {
 			return true
 		} else if h[i].Num == h[j].Num {
+			if len(h[i].Key) != len(h[j].Key) {
+				return len(h[i].Key) < len(h[j].Key)
+			}
 			if h[i].Key > h[j].Key {
 				return true
 			}
@@ -378,8 +381,33 @@ func getPrefixes(s, sep string) []string {
 			res[i] = res[i][:len(res[i])-1]
 		}
 	}
+
+	// 智能增强：检测首部是否包含 字母->数字 的自然业务边界（如 L0..., user123..., order000...）
+	// 当无显式分隔符或前缀首段包含字母+数字时，提取开头的纯字母作为公共父级业务前缀进行宏观聚合
+	first := ""
+	if len(res) > 0 {
+		first = res[0]
+	}
+	if len(first) > 0 {
+		letterEnd := 0
+		for letterEnd < len(first) && isAlpha(first[letterEnd]) {
+			letterEnd++
+		}
+		if letterEnd > 0 && letterEnd < len(first) && isDigit(first[letterEnd]) {
+			res = append(res, first[:letterEnd])
+		}
+	}
+
 	res = removeDuplicatesUnordered(res)
 	return res
+}
+
+func isAlpha(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
 }
 
 func hasAnySuffix(s, suffix string) bool {
