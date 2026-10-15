@@ -15,12 +15,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/urfave/cli"
-
-	"fmt"
-
 	"github.com/xueqiu/rdr/decoder"
 	"github.com/xueqiu/rdr/dump"
 )
@@ -46,6 +46,10 @@ func keys(c *cli.Context) {
 }
 
 func main() {
+	// Ignore SIGHUP to prevent termination when the parent shell / SSH session exits
+	// Equivalent to signal(SIGHUP, SIG_IGN)
+	signal.Ignore(syscall.SIGHUP)
+
 	app := cli.NewApp()
 	app.Name = "rdr"
 	app.Usage = "a tool to parse redis rdbfile"

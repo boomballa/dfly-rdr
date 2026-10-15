@@ -66,14 +66,8 @@ func Show(c *cli.Context) {
 		return
 	}
 
-	// 1. 忽略 SIGHUP 信号，防止终端断开或未加 nohup 运行时被系统挂断信号杀死
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP)
-	go func() {
-		for range sigChan {
-			// 忽略终端挂断信号，保障后台服务常驻
-		}
-	}()
+	// 1. 忽略 SIGHUP 信号，等价于 C 语言 signal(SIGHUP, SIG_IGN)
+	signal.Ignore(syscall.SIGHUP)
 
 	// parse rdbfile
 	fmt.Fprintln(c.App.Writer, "start parsing...")
