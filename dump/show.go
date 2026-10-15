@@ -1,3 +1,17 @@
+// Copyright 2017 XUEQIU.COM
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package dump
 
 import (
@@ -52,8 +66,31 @@ func Show(c *cli.Context) {
 	fmt.Fprintln(c.App.Writer, "start parsing...")
 	instances := []string{}
 	InitHTMLTmpl()
+
+	// 1. 同步解析初始指定的文件/目录，确保解析真正完成后再启动服务并输出 finished
+	for _, pathname := range c.Args() {
+		for _, v := range listPathFiles(pathname) {
+			filename := filepath.Base(v)
+
+			if !counters.Check(filename) {
+				decoder := decoder.NewDecoder()
+				fmt.Fprintf(c.App.Writer, "start to parse %v \n", filename)
+				go Decode(c, decoder, v)
+				counter := NewCounter()
+				counter.Count(decoder.Entries)
+				counters.Set(filename, counter)
+				fmt.Fprintf(c.App.Writer, "parse %v  done\n", filename)
+
+				instances = append(instances, filename)
+			}
+		}
+	}
+	tplCommonData["Instances"] = instances
+
+	// 2. 后台持续监控目录增量文件（如果是传入目录）
 	go func() {
 		for {
+			time.Sleep(5 * time.Second)
 			for _, pathname := range c.Args() {
 				for _, v := range listPathFiles(pathname) {
 					filename := filepath.Base(v)
@@ -68,18 +105,14 @@ func Show(c *cli.Context) {
 						fmt.Fprintf(c.App.Writer, "parse %v  done\n", filename)
 
 						instances = append(instances, filename)
-						// init html template
-						// init common data in template
 						tplCommonData["Instances"] = instances
 					}
 				}
-
 			}
-			time.Sleep(5 * time.Second)
 		}
 	}()
 
-	// start http server
+	// 3. 所有初始文件解析完成后启动 http 服务并输出完成提示
 	staticFS := assetfs.AssetFS{
 		Asset:     static.Asset,
 		AssetDir:  static.AssetDir,

@@ -25,6 +25,9 @@ func index(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 		http.Redirect(w, r, "/instance/"+key.(string), http.StatusFound)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`<!DOCTYPE html><html><head><meta http-equiv="refresh" content="3"><title>Parsing RDB...</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;text-align:center;padding:80px 20px;background:#f5f7fa;color:#333;}.box{max-width:500px;margin:0 auto;background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);}.spinner{border:4px solid #f3f3f3;border-top:4px solid #3498db;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:20px auto;}@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}</style></head><body><div class="box"><div class="spinner"></div><h2>RDB 解析中...</h2><p style="color:#666;">大文件解析需要一定时间，页面每 3 秒自动刷新检测，解析完成后将自动进入看板。</p></div></body></html>`))
 }
 
 func rdbReveal(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
