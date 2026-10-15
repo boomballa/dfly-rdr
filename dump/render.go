@@ -50,8 +50,11 @@ func rdbReveal(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 
 	largestKeyPrefixesByType := map[string][]*PrefixEntry{}
 	for _, entry := range counter.GetLargestKeyPrefixes() {
-		// mem use less than 1M, and list is long enough, not necessary to add
-		if entry.Bytes < 1000*1000 && len(largestKeyPrefixesByType[entry.Type]) > 50 {
+		// 提高各类型前缀展示数量上限至 100 条，低于 100KB 且已满 100 条时才忽略
+		if entry.Bytes < 100*1024 && len(largestKeyPrefixesByType[entry.Type]) >= 100 {
+			continue
+		}
+		if len(largestKeyPrefixesByType[entry.Type]) >= 100 {
 			continue
 		}
 		largestKeyPrefixesByType[entry.Type] = append(largestKeyPrefixesByType[entry.Type], entry)

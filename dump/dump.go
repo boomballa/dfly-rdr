@@ -90,8 +90,10 @@ func getData(filename string, cnt *Counter) map[string]interface{} {
 
 	largestKeyPrefixesByType := map[string][]*PrefixEntry{}
 	for _, entry := range cnt.GetLargestKeyPrefixes() {
-		// if mem usage is less than 1M, and the list is long enough, then it's unnecessary to add it.
-		if entry.Bytes < 1000*1000 && len(largestKeyPrefixesByType[entry.Type]) > 50 {
+		if entry.Bytes < 100*1024 && len(largestKeyPrefixesByType[entry.Type]) >= 100 {
+			continue
+		}
+		if len(largestKeyPrefixesByType[entry.Type]) >= 100 {
 			continue
 		}
 		largestKeyPrefixesByType[entry.Type] = append(largestKeyPrefixesByType[entry.Type], entry)

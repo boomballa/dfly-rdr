@@ -174,15 +174,36 @@ func (c *Counter) countByType(e *decoder.Entry) {
 	c.typeBytes[e.Type] += e.Bytes
 }
 
-func (c *Counter) countByKeyPrefix(e *decoder.Entry) {
-	// reset all numbers to 0
-	k := strings.Map(func(c rune) rune {
-		if c >= 48 && c <= 57 { //48 == "0" 57 == "9"
+func normalizeKey(s string) string {
+	// 归一化 Redis Cluster Hash Tag: 将 {xxx} 替换为 {}，使同业务不同分片 Key 聚合
+	if start := strings.IndexByte(s, '{'); start != -1 {
+		if end := strings.IndexByte(s[start:], '}'); end != -1 {
+			s = s[:start] + "{}" + s[start+end+1:]
+		}
+	}
+	// 将数字 0-9 归一化为 0
+	return strings.Map(func(c rune) rune {
+		if c >= '0' && c <= '9' {
 			return '0'
 		}
 		return c
-	}, e.Key)
+	}, s)
+}
+
+func (c *Counter) countByKeyPrefix(e *decoder.Entry) {
+	k := normalizeKey(e.Key)
 	prefixes := getPrefixes(k, c.separators)
+
+	// 如果 key 含有 {} (Hash Tag)，例如 {}rec_video_0g，也把剥离 {} 后的主体部分作为前缀加入聚合
+	if strings.HasPrefix(k, "{}") && len(k) > 2 {
+		rawSuffix := strings.TrimLeft(k[2:], c.separators)
+		if len(rawSuffix) > 0 {
+			for _, p := range getPrefixes(rawSuffix, c.separators) {
+				prefixes = append(prefixes, p)
+			}
+		}
+	}
+
 	key := typeKey{
 		Type: e.Type,
 	}
@@ -206,6 +227,8 @@ func (c *Counter) countBySlot(e *decoder.Entry) {
 }
 
 func (c *Counter) calcuLargestKeyPrefix(num int) {
+	// 按类型独立维护堆，防止某一种类型 (如海量 string) 挤占其他类型 (如 hash) 的 Top 名额
+	heapsByType := map[string]*prefixHeap{}
 	for key := range c.keyPrefixBytes {
 		k := &PrefixEntry{}
 		k.Type = key.Type
@@ -215,10 +238,24 @@ func (c *Counter) calcuLargestKeyPrefix(num int) {
 		delete(c.keyPrefixBytes, key)
 		delete(c.keyPrefixNum, key)
 
-		heap.Push(c.largestKeyPrefixes, k)
-		l := c.largestKeyPrefixes.Len()
-		if l > num {
-			heap.Pop(c.largestKeyPrefixes)
+		h, ok := heapsByType[k.Type]
+		if !ok {
+			h = &prefixHeap{}
+			heap.Init(h)
+			heapsByType[k.Type] = h
+		}
+
+		heap.Push(h, k)
+		if h.Len() > num {
+			heap.Pop(h)
+		}
+	}
+
+	c.largestKeyPrefixes = &prefixHeap{}
+	heap.Init(c.largestKeyPrefixes)
+	for _, h := range heapsByType {
+		for _, item := range *h {
+			heap.Push(c.largestKeyPrefixes, item)
 		}
 	}
 }
